@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>YouTube Live Chat</title>
+</head>
+<body>
+    <h1>YouTube Live Chat Messages</h1>
+    <ul id="chat-messages"></ul>
+
+    <script>
+        function fetchMessages() {
+            fetch('/get_live_chat_messages').then(response =>{console.log("Fetch Done...")})
+            fetch('/fetch_messages_from_firebase')
+                .then(response => response.json())
+                .then(data => {
+                    const chatMessages = document.getElementById('chat-messages');
+                    chatMessages.innerHTML = '';
+                    for (let key in data) {
+                        if (data.hasOwnProperty(key)) {
+                            const message = data[key];
+                            const li = document.createElement('li');
+                            li.innerHTML = `<strong>${message.displayName}:</strong> ${message.displayMessage}`;
+                            chatMessages.appendChild(li);
+                        }
+                    }
+                })
+                .catch(error => console.error('Error fetching messages:', error));
+        }
+
+        // Fetch messages every 5 seconds
+        setInterval(fetchMessages, 5000);
+
+        // Fetch messages initially
+        fetchMessages();
+    </script>
+</body>
+</html>
