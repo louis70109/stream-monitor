@@ -4,3 +4,6 @@ google-auth-httplib2
 google-api-python-client
 Flask
 firebase_admin
+python-dotenv
+grpcio
+google.generativeai

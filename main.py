@@ -1,3 +1,4 @@
+import json
 from flask import Flask, redirect, url_for, session, render_template
 from flask import request, jsonify
 from google_auth_oauthlib.flow import Flow
@@ -6,7 +7,14 @@ import os
 import google.oauth2.credentials
 import secrets
 import firebase_admin
+import google.generativeai as genai
 from firebase_admin import credentials, db
+
+if os.getenv('API_ENV') != 'production':
+    from dotenv import load_dotenv
+
+    load_dotenv()
+
 
 app = Flask(__name__)
 app.secret_key = secrets.token_hex(16)
@@ -31,8 +39,39 @@ firebase_admin.initialize_app(cred, {
     'databaseURL': os.getenv('FIREBASE_URL')
 })
 
+gemini_key = os.getenv('GEMINI_API_KEY')
 
-@app.route('/')
+# Initialize the Gemini Pro API
+genai.configure(api_key=gemini_key)
+
+
+def save_youtube_live_id_to_firebase(live_chat_id):
+    session['live_chat_id'] = live_chat_id
+    ref = db.reference('live_chat_id')
+    ref.set(live_chat_id)
+    return True
+
+
+def save_credentials_to_firebase(credentials):
+    session['credentials'] = credentials_to_dict(credentials)
+    ref = db.reference('credentials')
+    ref.set(credentials_to_dict(credentials))
+    return True
+
+
+def write_firebase_credentials_to_session():
+    ref = db.reference('credentials')
+    ref_live = db.reference('live_chat_id')
+    credentials = ref.get()
+    live_id = ref_live.get()
+    if credentials and live_id:
+        session['credentials'] = credentials
+        session['live_chat_id'] = live_id
+        return True
+    return False
+
+
+@app.route('/root')
 def index():
     return '''
         <h1>Welcome to YouTube API with Flask!</h1>
@@ -46,6 +85,7 @@ def index():
             }
         </script>
     '''
+
 
 @app.route('/authorize')
 def authorize():
@@ -61,6 +101,7 @@ def authorize():
     session['state'] = state
     return redirect(authorization_url)
 
+
 @app.route('/oauth2callback')
 def oauth2callback():
     state = session['state']
@@ -72,8 +113,8 @@ def oauth2callback():
     )
     flow.fetch_token(authorization_response=request.url)
 
-    credentials = flow.credentials
-    session['credentials'] = credentials_to_dict(credentials)
+    save_credentials_to_firebase(flow.credentials)
+    write_firebase_credentials_to_session()
 
     return '''
         <script>
@@ -87,7 +128,8 @@ def oauth2callback():
         </script>
     '''
 
-@app.route('/live')
+
+@app.route('/')
 def list_live_broadcasts():
     if 'credentials' not in session:
         return redirect(url_for('authorize'))
@@ -111,12 +153,25 @@ def list_live_broadcasts():
 
     if live_chat_id:
         session['live_chat_id'] = live_chat_id
-        return jsonify(response)
+        save_youtube_live_id_to_firebase(live_chat_id)
+        return '''
+            <h1>Welcome to YouTube API with Flask!</h1>
+            <a href="#" onclick="authorize('list')">Authorize to list live chat messages</a>
+            <a href="#" onclick="authorize('check')">Authorize to moderate chat messages</a>
+            <script>
+                function authorize(target) {
+                    localStorage.setItem('oauth_target', target);
+                    window.location.href = '/authorize';
+                }
+            </script>
+        '''
     else:
         return 'No live chat available for this broadcast.'
 
+
 @app.route('/list')
 def list_live_chat_messages():
+    write_firebase_credentials_to_session()
     if 'credentials' not in session:
         return redirect(url_for('authorize'))
     if 'live_chat_id' not in session:
@@ -127,6 +182,7 @@ def list_live_chat_messages():
 
 @app.route('/get_live_chat_messages')
 def get_live_chat_messages():
+    write_firebase_credentials_to_session()
     if 'credentials' not in session:
         return jsonify({'error': 'Not authorized'}), 401
     if 'live_chat_id' not in session:
@@ -167,6 +223,7 @@ def get_live_chat_messages():
 
 @app.route('/check')
 def moderate_chat_messages():
+    write_firebase_credentials_to_session()
     if 'credentials' not in session:
         return redirect(url_for('authorize'))
     if 'live_chat_id' not in session:
@@ -177,63 +234,51 @@ def moderate_chat_messages():
     )
     youtube = build('youtube', 'v3', credentials=credentials)
 
-    live_chat_id = session['live_chat_id']
-    next_page_token = session.get('next_page_token')
-
-    request = youtube.liveChatMessages().list(
-        liveChatId=live_chat_id,
-        part="snippet,authorDetails",
-        pageToken=next_page_token
-    )
-    response = request.execute()
-
-    messages = response.get('items', [])
-    session['next_page_token'] = response.get('nextPageToken')
-    
+    ref = db.reference('live_chat_id')
+    live_chat_id = str(ref.get())
+    messages = get_messages_from_firebase()
     # 检查关键字并采取行动
-    for message in messages:
-        
-        message_text = message['snippet']['displayMessage']
-        print(message_text)
-        author_channel_id = message['authorDetails']['channelId']
-        message_id = message['id']
+    # for message in messages:
 
-        if 'ban_word' in message_text:
-            # 禁止用户
-            youtube.liveChatBans().insert(
-                part='snippet',
-                body={
-                    'snippet': {
-                        'liveChatId': live_chat_id,
-                        'bannedUserDetails': {
-                            'channelId': author_channel_id
-                        },
-                        'type': 'permanent'
-                    }
+    #     message_text = message['snippet']['displayMessage']
+    #     print(message_text)
+    #     author_channel_id = message['authorDetails']['channelId']
+    #     message_id = message['id']
+
+    model = genai.GenerativeModel('gemini-pro')
+    response = model.generate_content(
+        f'你現在是一個英雄聯盟的遊戲直播主，請針對以下的內容，用一句話回覆用戶內容。\n{messages}')
+    print(response.text)
+    # 回复用户
+    youtube.liveChatMessages().insert(
+        part='snippet',
+        body={
+            'snippet': {
+                'liveChatId': live_chat_id,
+                'type': 'textMessageEvent',
+                'textMessageDetails': {
+                    'messageText': response.text
                 }
-            ).execute()
-        elif 'aaa' in message_text:
-            # 回复用户
-            youtube.liveChatMessages().insert(
-                part='snippet',
-                body={
-                    'snippet': {
-                        'liveChatId': live_chat_id,
-                        'type': 'textMessageEvent',
-                        'textMessageDetails': {
-                            'messageText': f'@{message["authorDetails"]["displayName"]} Thanks for your message!'
-                        }
-                    }
-                }
-            ).execute()
+            }
+        }
+    ).execute()
 
     return jsonify({'status': 'Moderation actions completed'})
+
 
 @app.route('/fetch_messages_from_firebase')
 def fetch_messages_from_firebase():
     ref = db.reference('messages')
     messages = ref.get()
     return jsonify(messages)
+
+
+def get_messages_from_firebase():
+    ref = db.reference('messages')
+    messages = ref.get()
+
+    return str(messages)
+
 
 def credentials_to_dict(credentials):
     return {
@@ -244,6 +289,7 @@ def credentials_to_dict(credentials):
         'client_secret': credentials.client_secret,
         'scopes': credentials.scopes
     }
+
 
 if __name__ == '__main__':
     app.run('localhost', 5000, debug=True)

@@ -2,3 +2,4 @@ venv
 service_key.json
 client_secret.json
 .env
+__pycache__
